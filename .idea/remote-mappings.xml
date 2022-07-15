@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="RemoteMappingsManager">
+    <list>
+      <list>
+        <remote-mappings server-id="python@sftp://yushiliu2@134.2.56.206:22/home/yushiliu2/anaconda3/envs/project/bin/python">
+          <settings>
+            <list>
+              <mapping local-root="$PROJECT_DIR$" remote-root="/home/yushiliu2/research_project" />
+              <mapping local-root="$PROJECT_DIR$/data" remote-root="/home/yushiliu2/research_project/data" />
+              <mapping local-root="$PROJECT_DIR$/papers" remote-root="/home/yushiliu2/research_project/papers" />
+            </list>
+          </settings>
+        </remote-mappings>
+      </list>
+    </list>
+  </component>
+</project>
