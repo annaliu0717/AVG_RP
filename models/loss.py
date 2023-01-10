@@ -1,51 +1,74 @@
+import pytorch3d.structures
+from pytorch3d.loss import mesh_normal_consistency
 import torch
-import torch as T
 from torch import nn
-import utils.general as utils
+import torch.nn.functional as F
 
 class RenderLoss(nn.Module):
-	def __init__(self, alpha=2e-3):
+	def __init__(self, mask_loss, weight_rgb=1.0, weight_normal=0.1, weight_mask=0.5):
 		super(RenderLoss, self).__init__()
-		self.alpha = alpha
-	def forward(self, model_outputs: dict, ground_truth: T.tensor):
+		self.weight_rgb = weight_rgb
+		self.weight_normal = weight_normal
+		self.weight_mask = weight_mask
+		self.rgb_loss_function = nn.L1Loss(reduction='mean')
+		self.bce_loss = nn.BCELoss(reduction='mean')
+
+		self.mask_loss = mask_loss()
+
+	def forward(self, model_outputs: dict, ground_truth: torch.tensor):
 		device = model_outputs['rgb_map'].get_device()
-		# uvs = model_outputs['uvs_near_surface']  # b x n x k x 2
-		# uvs = uvs.view(uvs.shape[0], -1, 2)  # b x nk x 2
 		rgb_gt = ground_truth['rgb'].to(device)
-		# rgb_whole = ground_truth['rgb_whole'].to(device)
-		confs = model_outputs['confs'] + 1e-4
-		# rgb_syn = self.interpolation(uvs, rgb_whole)
-		loss = nn.L1Loss(reduction='mean')
-		l_sparse = (T.log(confs) + T.log(1 - confs)).sum() / confs.size().numel()
-		rgb_loss = loss(model_outputs['rgb_map'], rgb_gt) + self.alpha * l_sparse
-		# + loss(model_outputs['rgb_near_surface'], rgb_syn)
-		return rgb_loss
-	def interpolation(self, uvs, rgb_gt):
-		pixel_coords_1 = T.stack([uvs[..., 0].floor(), uvs[..., 1].floor()], dim=-1).long()# x1 y1 b x n  x 2
-		pixel_coords_2 = T.stack([uvs[..., 0].floor(), uvs[..., 1].ceil()], dim=-1).long()  # x1 y2
-		pixel_coords_3 = T.stack([uvs[..., 0].ceil(), uvs[..., 1].floor()], dim=-1).long()  # x2 y1
-		pixel_coords_4 = T.stack([uvs[..., 0].ceil(), uvs[..., 1].ceil()], dim=-1).long()  # x2 y2
-		def gather_rgb(pix_coord, rgb):
-			batch, w, h, d = rgb.size()
-			_, n, _ = pix_coord.size()
-			rgb_gt = torch.zeros(batch, n, d).to(rgb.device)
-			for b in range(batch):
-				pix_coord_valid_b = pix_coord[b, ((pix_coord[b, :, 0] < w) &
-				                                  (pix_coord[b, :, 1] < h) &
-				                                  (pix_coord[b, :, 0] >= 0) &
-				                                  (pix_coord[b, :, 1] >= 0))]
-				rgb_gt[b, (pix_coord[b, :, 0] < w) &
-				          (pix_coord[b, :, 1] < h) &
-				          (pix_coord[b, :, 0] >= 0) &
-				          (pix_coord[b, :, 1] >= 0), :] = rgb[b,
-				                                          pix_coord_valid_b[:, 0],
-				                                          pix_coord_valid_b[:, 1], :]
-				del pix_coord_valid_b
-			return rgb_gt
-		f_xy1 = (pixel_coords_3[..., 0] - uvs[..., 0]).unsqueeze(-1) * gather_rgb(pixel_coords_1, rgb_gt) +\
-		         (uvs[..., 0] - pixel_coords_1[..., 0]).unsqueeze(-1) * gather_rgb(pixel_coords_3, rgb_gt)
-		f_xy2 = (pixel_coords_3[..., 0] - uvs[..., 0]).unsqueeze(-1) * gather_rgb(pixel_coords_2, rgb_gt) +\
-		         (uvs[..., 0] - pixel_coords_1[..., 0]).unsqueeze(-1) * gather_rgb(pixel_coords_4, rgb_gt)
-		rgb_syn = (pixel_coords_2[..., 1] - uvs[..., 1]).unsqueeze(-1) * f_xy1 +\
-		          (uvs[..., 1] - pixel_coords_1[..., 1]).unsqueeze(-1) * f_xy2
-		return rgb_syn
+		mask_gt = ground_truth['mask'].to(device).float()
+		mesh = model_outputs['mesh']
+		mask = model_outputs['mask']
+		mask = mask.clamp(1e-3, 1.0 - 1e-3)
+		mask_loss_func2 = nn.MSELoss(reduction='mean')
+		mask_loss = self.mask_loss(mask, mask_gt)
+		if 'mask_rast' in model_outputs:
+			mask_rast = model_outputs['mask_rast']
+			mask_loss2 = mask_loss_func2(mask_rast, mask_gt)
+		else:
+			mask_loss2 = 0.
+
+		idx = (mask + mask_gt) > 0
+
+		mesh_p3d = pytorch3d.structures.Meshes(verts=mesh.get_vertices().unsqueeze(0),
+		                                       faces=mesh.get_faces().unsqueeze(0),
+		                                       verts_normals=mesh.get_vert_normals().unsqueeze(0))
+		normal_consistency = mesh_normal_consistency(mesh_p3d)
+
+		rgb_loss = self.rgb_loss(model_outputs['rgb_map'], rgb_gt, idx)
+
+
+		return self.weight_rgb * rgb_loss +\
+		       self.weight_normal * normal_consistency +\
+		       self.weight_mask * (mask_loss + mask_loss2)
+
+	def rgb_loss(self, rgb_pre, rgb_gt, idx=None):
+		if idx is None:
+			return self.rgb_loss_function(rgb_pre, rgb_gt)
+		else:
+			return self.rgb_loss_function(rgb_pre[..., idx, :], rgb_gt[..., idx, :])
+
+	def normal_consistency_loss(self, mesh):
+		""" Compute the normal consistency term as the cosine similarity between neighboring face normals.
+		Args:
+				mesh (Mesh): Mesh with face normals.
+		"""
+
+		loss = 1 - torch.cosine_similarity(mesh.face_normals[mesh.connected_faces[:, 0]],
+		                                   mesh.face_normals[mesh.connected_faces[:, 1]], dim=1)
+		return (loss ** 2).mean()
+
+
+class FocalLoss(nn.Module):
+	def __init__(self, gamma=2., alpha=1.):
+		super(FocalLoss, self).__init__()
+		self.gamma = gamma
+		self.alpha = alpha
+
+	def forward(self, inputs, targets):
+		BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+		pt = torch.exp(-BCE_loss)  # prevents nans when probability 0
+		F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+		return F_loss.mean()
